@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+tests/output/
+changelogs/.plugin-cache.yaml
+*.tar.gz
+.DS_Store

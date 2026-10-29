@@ -1,0 +1,2 @@
+# Python requirements on the managed nodes (the hosts whose files are edited)
+ruamel.yaml>=0.17

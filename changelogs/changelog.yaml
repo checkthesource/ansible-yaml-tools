@@ -1,0 +1,23 @@
+ancestor: null
+releases:
+  1.0.0:
+    changes:
+      release_summary: 'First release of the ``checkthesource.yaml_tools`` collection: edit
+        YAML files from
+
+        Ansible without reformatting them. Every edit is lossless whenever possible
+
+        and is verified before the file is written.
+
+        '
+    fragments:
+    - 1.0.0.yml
+    modules:
+    - description: Set or remove values in a YAML file without reformatting it.
+      name: yaml_edit
+      namespace: ''
+    - description: Add, update or remove items of a list in a YAML file without reformatting
+        it.
+      name: yaml_list
+      namespace: ''
+    release_date: '2026-10-29'

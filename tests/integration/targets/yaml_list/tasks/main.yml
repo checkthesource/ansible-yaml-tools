@@ -1,0 +1,197 @@
+---
+# Integration tests for yaml_list.
+# Run with: ansible-test integration yaml_list
+
+- name: Create a work directory
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_list
+  register: workdir
+
+- name: Run the tests
+  vars:
+    deployment: "{{ workdir.path }}/deployment.yaml"
+    original: |
+      # Web deployment
+      spec:
+        containers:
+        - name: web
+          image: nginx:1.25   # pinned
+        - name: sidecar
+          image: busybox
+        tags: [blue]
+  block:
+    - name: Write the test file
+      ansible.builtin.copy:
+        dest: "{{ deployment }}"
+        content: "{{ original }}"
+        mode: "0644"
+
+    # --- add -------------------------------------------------------------------
+    - name: Add a container after "web" in check mode
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.containers
+        identify_by: [name]
+        after:
+          name: web
+        item:
+          name: metrics
+          image: exporter:1
+      check_mode: true
+      diff: true
+      register: add_check
+
+    - name: Add a container after "web"
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.containers
+        identify_by: [name]
+        after:
+          name: web
+        item:
+          name: metrics
+          image: exporter:1
+      register: add
+
+    - name: Add the same container again
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.containers
+        identify_by: [name]
+        after:
+          name: web
+        item:
+          name: metrics
+          image: exporter:1
+      register: add_again
+
+    - name: Check the addition
+      ansible.builtin.assert:
+        that:
+          - add_check is changed
+          - add_check.diff.before == original
+          - add is changed
+          - add.action == 'added'
+          - add.index == 1
+          - add.method == 'lossless'
+          - add_again is not changed
+          - add_again.action == 'unchanged'
+          - data.spec.containers | map(attribute='name') | list == ['web', 'metrics', 'sidecar']
+          - "'image: nginx:1.25   # pinned' in lookup('file', deployment)"
+      vars:
+        data: "{{ lookup('file', deployment) | from_yaml }}"
+
+    # --- update ----------------------------------------------------------------
+    - name: Update a container identified by its name
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.containers
+        identify_by: [name]
+        item:
+          name: metrics
+          image: exporter:2
+      register: update
+
+    - name: Check the update
+      ansible.builtin.assert:
+        that:
+          - update is changed
+          - update.action == 'updated'
+          - update.index == 1
+          - (lookup('file', deployment) | from_yaml).spec.containers[1].image == 'exporter:2'
+
+    # --- positions and inline lists --------------------------------------
+    - name: Add tags at different positions
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.tags
+        item: "{{ item.value }}"
+        position: "{{ item.position | default(omit) }}"
+        index: "{{ item.index | default(omit) }}"
+      loop:
+        - value: green
+        - value: red
+          position: start
+        - value: "yes"
+          index: 1
+
+    - name: Check the tags
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', deployment) | from_yaml).spec.tags == ['red', 'yes', 'blue', 'green']
+
+    # --- remove ----------------------------------------------------------------
+    - name: Remove a container by name
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.containers
+        identify_by: [name]
+        item:
+          name: sidecar
+        state: absent
+      register: removed
+
+    - name: Remove a missing tag
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.tags
+        item: purple
+        state: absent
+      register: remove_missing
+
+    - name: Check the removal
+      ansible.builtin.assert:
+        that:
+          - removed is changed
+          - removed.removed == 1
+          - remove_missing is not changed
+          - (lookup('file', deployment) | from_yaml).spec.containers | map(attribute='name') | list == ['web', 'metrics']
+
+    # --- create ----------------------------------------------------------------
+    - name: Create a missing list
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.volumes
+        item:
+          name: data
+      register: created
+
+    - name: Check the new list
+      ansible.builtin.assert:
+        that:
+          - created.action == 'created'
+          - "(lookup('file', deployment) | from_yaml).spec.volumes == [{'name': 'data'}]"
+
+    # --- errors ----------------------------------------------------------------
+    - name: A missing anchor item is an error
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.tags
+        item: white
+        after: nope
+      register: no_anchor
+      ignore_errors: true
+
+    - name: Position options are exclusive
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ deployment }}"
+        key: spec.tags
+        item: white
+        index: 0
+        position: end
+      register: exclusive
+      ignore_errors: true
+
+    - name: Check errors
+      ansible.builtin.assert:
+        that:
+          - no_anchor is failed
+          - "'no item' in no_anchor.msg"
+          - exclusive is failed
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir.path }}"
+        state: absent

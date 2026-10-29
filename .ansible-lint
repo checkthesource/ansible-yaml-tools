@@ -1,0 +1,9 @@
+---
+# ansible-lint configuration. Run with: ansible-lint
+profile: production
+
+exclude_paths:
+  # Generated and rewritten by antsibull-changelog; never edited by hand.
+  - changelogs/changelog.yaml
+  - changelogs/config.yaml
+  - tests/output/

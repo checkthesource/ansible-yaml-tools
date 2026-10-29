@@ -1,0 +1,29 @@
+---
+namespace: checkthesource
+name: yaml_tools
+version: 1.0.0
+readme: README.md
+authors:
+  - checkthesource (@checkthesource)
+description: Edit values and lists in YAML files without reformatting them. Lossless, verified and idempotent.
+license:
+  - GPL-3.0-or-later
+tags:
+  - yaml
+  - files
+  - configuration
+  - tools
+dependencies: {}
+repository: https://github.com/checkthesource/ansible-yaml-tools
+documentation: https://github.com/checkthesource/ansible-yaml-tools#readme
+issues: https://github.com/checkthesource/ansible-yaml-tools/issues
+build_ignore:
+  - .github
+  - .gitignore
+  - .ansible-lint
+  - .pytest_cache
+  - .ruff_cache
+  - '**/__pycache__'
+  - '*.pyc'
+  - tests/output
+  - '*.tar.gz'

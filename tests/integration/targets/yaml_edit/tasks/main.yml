@@ -1,0 +1,320 @@
+---
+# Integration tests for yaml_edit.
+# Run with: ansible-test integration yaml_edit
+
+- name: Create a work directory
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_edit
+  register: workdir
+
+- name: Run the tests
+  vars:
+    config: "{{ workdir.path }}/config.yaml"
+    original: |
+      # Application settings
+      server:
+          host: "localhost"   # where to listen
+          port: 80
+          tags:
+            - web
+            - api
+
+      # Logging
+      logging:
+          level: info
+  block:
+    - name: Write the test file
+      ansible.builtin.copy:
+        dest: "{{ config }}"
+        content: "{{ original }}"
+        mode: "0640"
+
+    # --- check mode ---------------------------------------------------------
+    - name: Change a value in check mode
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 8080
+      check_mode: true
+      diff: true
+      register: check_run
+
+    - name: Read the file after check mode
+      ansible.builtin.slurp:
+        src: "{{ config }}"
+      register: after_check
+
+    - name: Check mode reports a change but does not write
+      ansible.builtin.assert:
+        that:
+          - check_run is changed
+          - check_run.method == 'lossless'
+          - check_run.previous_value == 80
+          - "'port: 8080' in check_run.diff.after"
+          - (after_check.content | b64decode) == original
+
+    # --- lossless edit and idempotence -------------------------------------
+    - name: Change a value
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 8080
+        backup: true
+      register: first_run
+
+    - name: Change the same value again
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 8080
+      register: second_run
+
+    - name: Read the file
+      ansible.builtin.slurp:
+        src: "{{ config }}"
+      register: after_edit
+
+    - name: Stat the edited file
+      ansible.builtin.stat:
+        path: "{{ config }}"
+      register: config_stat
+
+    - name: Only the value changed, permissions are kept and the second run is a no-op
+      ansible.builtin.assert:
+        that:
+          - first_run is changed
+          - first_run.method == 'lossless'
+          - first_run.backup_file is defined
+          - second_run is not changed
+          - "(after_edit.content | b64decode) == original | replace('port: 80', 'port: 8080')"
+          - config_stat.stat.mode == '0640'
+
+    # --- value_type ----------------------------------------------------------
+    - name: Set an integer from a string
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: "9090"
+        value_type: int
+      register: typed
+
+    - name: The value is written as an integer
+      ansible.builtin.assert:
+        that:
+          - typed is changed
+          - typed.value == 9090
+          - (lookup('file', config) | from_yaml).server.port == 9090
+
+    # --- create and remove ---------------------------------------------------
+    - name: Add a nested dictionary
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: logging.handlers.file
+        value:
+          level: debug
+          path: /var/log/app.log
+
+    - name: Remove a list item
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.tags[0]
+        state: absent
+
+    - name: Remove a missing key
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.nope
+        state: absent
+      register: remove_missing
+
+    - name: Check the data
+      ansible.builtin.assert:
+        that:
+          - remove_missing is not changed
+          - data.logging.handlers.file.level == 'debug'
+          - data.server.tags == ['api']
+          - "'# Logging' in lookup('file', config)"
+      vars:
+        data: "{{ lookup('file', config) | from_yaml }}"
+
+    # --- strings that YAML could misread -----------------------------------
+    - name: Write strings that look like other types
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: ["strings", "{{ item.key }}"]
+        value: "{{ item.value }}"
+        value_type: str
+      loop: "{{ {'a': 'yes', 'b': 'null', 'c': '0777', 'd': 'a: b', 'e': '#x'} | dict2items }}"
+
+    - name: Strings are read back as strings by Ansible (YAML 1.1)
+      ansible.builtin.assert:
+        that:
+          - "data.strings == {'a': 'yes', 'b': 'null', 'c': '0777', 'd': 'a: b', 'e': '#x'}"
+      vars:
+        data: "{{ lookup('file', config) | from_yaml }}"
+
+    # --- key position ------------------------------------------------------
+    - name: Add a key right after another one
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.timeout
+        value: 30
+        after: port
+
+    - name: The new key follows its sibling
+      ansible.builtin.assert:
+        that:
+          - "(lookup('file', config) | from_yaml).server.keys() | list == ['host', 'port', 'timeout', 'tags']"
+
+    # --- several edits, one write -------------------------------------------
+    - name: Make several edits in one task
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        backup: true
+        edits:
+          - key: server.port
+            value: 7000
+          - key: server.workers
+            value: "4"
+            value_type: int
+          - key: server.timeout
+            state: absent
+      register: batch
+
+    - name: Run the same edits again
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        edits:
+          - key: server.port
+            value: 7000
+          - key: server.workers
+            value: "4"
+            value_type: int
+          - key: server.timeout
+            state: absent
+      register: batch_again
+
+    - name: A failing edit leaves the file untouched
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        edits:
+          - key: server.port
+            value: 1
+          - key: server.port.nested
+            value: 2
+      register: batch_error
+      ignore_errors: true
+
+    - name: Check the batch
+      ansible.builtin.assert:
+        that:
+          - batch is changed
+          - batch.results | length == 3
+          - batch.results | map(attribute='changed') | list == [true, true, true]
+          - batch.results[0].previous_value == 9090
+          - batch.backup_file is defined
+          - batch_again is not changed
+          - batch_error is failed
+          - "'edits[1]' in batch_error.msg"
+          - data.server.port == 7000
+          - data.server.workers == 4
+          - "'timeout' not in data.server"
+      vars:
+        data: "{{ lookup('file', config) | from_yaml }}"
+
+    # --- symbolic links ------------------------------------------------------
+    - name: Create a symbolic link to the file
+      ansible.builtin.file:
+        src: "{{ config }}"
+        dest: "{{ workdir.path }}/link.yaml"
+        state: link
+
+    - name: Edit through the link
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ workdir.path }}/link.yaml"
+        key: server.host
+        value: example.com
+
+    - name: Stat the link
+      ansible.builtin.stat:
+        path: "{{ workdir.path }}/link.yaml"
+      register: link_stat
+
+    - name: The link is kept and the target is edited
+      ansible.builtin.assert:
+        that:
+          - link_stat.stat.islnk
+          - (lookup('file', config) | from_yaml).server.host == 'example.com'
+
+    # --- validate ----------------------------------------------------------------
+    - name: A failing validation leaves the file untouched
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 1
+        validate: "false %s"
+      register: bad_validate
+      ignore_errors: true
+
+    - name: A passing validation is applied
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 2
+        validate: "test -s %s"
+      register: good_validate
+
+    - name: Validate must contain %s
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ config }}"
+        key: server.port
+        value: 3
+        validate: "true"
+      register: no_placeholder
+      ignore_errors: true
+
+    - name: Check validation
+      ansible.builtin.assert:
+        that:
+          - bad_validate is failed
+          - good_validate is changed
+          - no_placeholder is failed
+          - (lookup('file', config) | from_yaml).server.port == 2
+
+    # --- errors ------------------------------------------------------------------
+    - name: Missing file
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ workdir.path }}/missing.yaml"
+        key: a
+        value: 1
+      register: missing_file
+      ignore_errors: true
+
+    - name: Write an invalid YAML file that contains a secret
+      ansible.builtin.copy:
+        dest: "{{ workdir.path }}/broken.yaml"
+        content: "password: s3cr3t\nbad: [unclosed\n"
+        mode: "0600"
+
+    - name: Edit the invalid file
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ workdir.path }}/broken.yaml"
+        key: a
+        value: 1
+      register: broken
+      ignore_errors: true
+
+    - name: Errors are reported without leaking file content
+      ansible.builtin.assert:
+        that:
+          - missing_file is failed
+          - "'does not exist' in missing_file.msg"
+          - broken is failed
+          - "'s3cr3t' not in broken.msg"
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir.path }}"
+        state: absent
