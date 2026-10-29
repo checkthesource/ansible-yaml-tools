@@ -74,7 +74,7 @@ jobs:
       - name: Build the collection
         run: |
           ansible-galaxy collection build --output-path dist/
-          sha256sum dist/*.tar.gz | tee dist/SHA256SUMS
+          cd dist && sha256sum -- *.tar.gz | tee SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: collection
