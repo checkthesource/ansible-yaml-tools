@@ -2,8 +2,8 @@ ancestor: null
 releases:
   1.0.0:
     changes:
-      release_summary: 'First release of the ``checkthesource.yaml_tools`` collection: edit
-        YAML files from
+      release_summary: 'First release of the ``checkthesource.yaml_tools`` collection:
+        edit YAML files from
 
         Ansible without reformatting them. Every edit is lossless whenever possible
 
@@ -21,3 +21,14 @@ releases:
       name: yaml_list
       namespace: ''
     release_date: '2026-10-29'
+  1.0.1:
+    changes:
+      release_summary: 'First release published on Ansible Galaxy. Version 1.0.0 was
+        tagged on GitHub
+
+        but never published, because of a problem in the release workflow.
+
+        '
+    fragments:
+    - 1.0.1.yml
+    release_date: '2026-10-30'
