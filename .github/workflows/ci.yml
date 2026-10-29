@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Install tools
         run: pip install ansible-core ansible-lint antsibull-changelog
       - name: Run ansible-lint
@@ -35,12 +35,16 @@ jobs:
         working-directory: ${{ env.COLLECTION_PATH }}
 
   unit:
+    # Runs in the official Python images, because GitHub's runners no longer
+    # ship old Python versions. Python 3.6 is the default (platform) Python of
+    # RHEL 8 managed nodes, Python 3.9 the default of RHEL 9.
     name: Unit tests (Python ${{ matrix.python }}, ruamel.yaml ${{ matrix.ruamel }})
     runs-on: ubuntu-latest
+    container: python:${{ matrix.python }}-slim
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.11", "3.13"]
+        python: ["3.6", "3.9", "3.11", "3.13"]
         ruamel: ["0.17.*", "0.18.*", "latest"]
         exclude:
           - python: "3.13"
@@ -49,12 +53,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
-        with:
-          python-version: ${{ matrix.python }}
       - name: Install dependencies
+        # pip picks the newest ansible-core that supports this Python. The tests
+        # only use its module_utils, which are the same on managed nodes.
         run: |
-          python -m pip install --upgrade pip
           if [ "${{ matrix.ruamel }}" = "latest" ]; then
             pip install ruamel.yaml
           else
@@ -64,30 +66,27 @@ jobs:
       - name: Run unit tests
         run: python -m pytest -v tests/unit
 
-  unit-python36:
-    # Python 3.6 is the default (platform) Python of RHEL 8 managed nodes,
-    # which ansible-core 2.16 still supports as a target.
-    name: Unit tests (Python 3.6, RHEL 8 managed nodes)
-    runs-on: ubuntu-latest
-    container: python:3.6-slim
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install dependencies
-        # ansible-core 2.11 is the last release that installs on Python 3.6;
-        # the tests only use its module_utils, which are the same on targets.
-        run: pip install "ansible-core<2.12" "ruamel.yaml" pytest
-      - name: Run unit tests
-        run: python -m pytest -v tests/unit
-
   sanity:
     name: Sanity (ansible-core ${{ matrix.ansible }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        ansible: ["stable-2.16", "stable-2.17", "stable-2.19", "stable-2.21", "stable-2.22", "devel"]
+        # Each ansible-core release supports a different range of Python
+        # versions on the controller.
+        include:
+          - ansible: stable-2.16
+            python: "3.12"
+          - ansible: stable-2.17
+            python: "3.12"
+          - ansible: stable-2.19
+            python: "3.13"
+          - ansible: stable-2.21
+            python: "3.13"
+          - ansible: stable-2.22
+            python: "3.13"
+          - ansible: devel
+            python: "3.13"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -95,7 +94,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Install ansible-core
         run: pip install https://github.com/ansible/ansible/archive/${{ matrix.ansible }}.tar.gz
       - name: Run sanity tests
@@ -108,7 +107,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ansible: ["stable-2.16", "stable-2.17", "stable-2.19", "stable-2.21", "stable-2.22", "devel"]
+        include:
+          - ansible: stable-2.16
+            python: "3.12"
+          - ansible: stable-2.17
+            python: "3.12"
+          - ansible: stable-2.19
+            python: "3.13"
+          - ansible: stable-2.21
+            python: "3.13"
+          - ansible: stable-2.22
+            python: "3.13"
+          - ansible: devel
+            python: "3.13"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -116,11 +127,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Install dependencies
         run: |
           pip install https://github.com/ansible/ansible/archive/${{ matrix.ansible }}.tar.gz
           pip install -r ${{ env.COLLECTION_PATH }}/requirements.txt
       - name: Run integration tests
-        run: ansible-test integration -v --color --local --python 3.12
+        run: ansible-test integration -v --color --local --python ${{ matrix.python }}
         working-directory: ${{ env.COLLECTION_PATH }}
