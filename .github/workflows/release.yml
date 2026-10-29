@@ -45,7 +45,7 @@ jobs:
         run: python -m pytest tests/unit
         working-directory: ${{ env.COLLECTION_PATH }}
       - name: Sanity tests
-        run: ansible-test sanity --docker --color
+        run: ansible-test sanity --local --python 3.13 --requirements --color
         working-directory: ${{ env.COLLECTION_PATH }}
 
   build:

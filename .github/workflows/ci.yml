@@ -98,7 +98,9 @@ jobs:
       - name: Install ansible-core
         run: pip install https://github.com/ansible/ansible/archive/${{ matrix.ansible }}.tar.gz
       - name: Run sanity tests
-        run: ansible-test sanity --docker -v --color
+        # --local instead of --docker: the ansible-test containers cannot start
+        # on the current GitHub runners (cgroup remount fails).
+        run: ansible-test sanity --local --python ${{ matrix.python }} --requirements -v --color
         working-directory: ${{ env.COLLECTION_PATH }}
 
   integration:
