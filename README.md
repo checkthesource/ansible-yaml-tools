@@ -31,6 +31,8 @@ order and line endings stay exactly as they were.
 | --- | --- |
 | [`yaml_edit`](#yaml_edit-set-or-remove-values) | Set or remove values, add keys at a given position, make several edits in one task. |
 | [`yaml_list`](#yaml_list-add-update-or-remove-list-items) | Add, update or remove items of a list, at the end, at the start, at an index or next to another item. |
+| [`yaml_merge`](#yaml_merge-merge-a-dictionary) | Deep-merge a dictionary into the file: only the differences are written. |
+| [`yaml_info`](#yaml_info-read-a-value) | Read a value, its type and whether it exists, without changing the file. |
 
 Full documentation for each module is available with `ansible-doc`, for example
 `ansible-doc checkthesource.yaml_tools.yaml_list`.
@@ -63,6 +65,13 @@ move.
 - **Safe values.** Strings that YAML could misread (`yes`, `null`, `0777`,
   `a: b`, `#x`…) are quoted, so they are read back as strings under both YAML
   1.1 (Ansible, PyYAML) and YAML 1.2.
+- **Select items and documents by content.** `users[name=alice].shell`
+  reaches a field of a list item without knowing its index, and
+  `document: {kind: Deployment, metadata.name: web}` picks one manifest in a
+  multi-document file.
+- **Typed values from templates.** Before ansible-core 2.19, Ansible passes
+  every templated number as a string. The modules write `"{{ port }}"` as
+  `8080`, not `'8080'`, so files stay clean and tasks stay idempotent.
 - **Ansible-friendly.** Check mode, diff mode, `backup`, `validate`, and the
   usual `owner` / `group` / `mode` options.
 - **Multi-document files** (`---`), Windows line endings, UTF-8 byte order
@@ -125,7 +134,7 @@ To ship it with a project, install it next to your playbooks with
 
 ## Key paths
 
-Both modules address values with the same key path syntax:
+Every module addresses values with the same key path syntax:
 
 | Key | Meaning |
 | --- | --- |
@@ -136,8 +145,18 @@ Both modules address values with the same key path syntax:
 | `annotations["example.com/owner"]` | A key that contains dots |
 | `a\.b` | Same, with a backslash before the dot |
 | `["metadata", "annotations", "example.com/owner"]` | List form: one item per level, never needs escaping |
+| `users[name=alice].shell` | Key `shell` of the item of `users` whose `name` is `alice` |
+| `containers[name=web,image="nginx:1.27"]` | Several conditions; quote values that contain `,` or `]` |
+| `items[metadata.name=web]` | A nested field |
+| `["users", {"name": "alice"}, "shell"]` | A selector in the list form |
 
 Keys are matched by their text, so `ports.80` finds both `80:` and `'80':`.
+Selector values are compared the same way, so `[port=80]` matches `port: 80`
+and `port: '80'`.
+
+A selector must match **exactly one** item. The task fails when several items
+match, and also when none does, except when removing or renaming (there is
+then nothing to do). Selectors don't create items: use `yaml_list` to add them.
 
 ## yaml_edit: set or remove values
 
@@ -148,12 +167,26 @@ Keys are matched by their text, so `ports.80` finds both `80:` and `'80':`.
     key: logging.level
     value: debug
 
-- name: Keep a templated value an integer
+- name: Change one field of a list item chosen by its name
+  checkthesource.yaml_tools.yaml_edit:
+    path: /etc/myapp/users.yaml
+    key: users[name=alice].shell
+    value: /bin/zsh
+
+- name: Rename a key (its value, comments and position are kept)
   checkthesource.yaml_tools.yaml_edit:
     path: /etc/myapp/config.yaml
-    key: server.port
-    value: "{{ app_port }}"
-    value_type: int
+    key: server.listen
+    rename_to: bind
+
+- name: Edit one manifest of a multi-document file
+  checkthesource.yaml_tools.yaml_edit:
+    path: app.yaml
+    document:
+      kind: Deployment
+      metadata.name: web
+    key: spec.replicas
+    value: "{{ replicas }}"
 
 - name: Add a new key right after an existing one
   checkthesource.yaml_tools.yaml_edit:
@@ -192,11 +225,12 @@ Keys are matched by their text, so `ports.80` finds both `80:` and `'80':`.
 | --- | --- | --- |
 | `key` | | Key path of the value. Required unless `edits` is used. |
 | `value` | | Value to set: string, number, boolean, list or dictionary. |
-| `value_type` | `raw` | Convert `value` first: `raw`, `str`, `int`, `float`, `bool` or `null`. |
+| `value_type` | `raw` | Convert `value` first: `raw`, `str`, `int`, `float`, `bool` or `null`. Takes precedence over `infer_types`. |
 | `state` | `present` | `present` sets the value, `absent` removes it. |
 | `create` | `true` | Create the key and missing parent mappings. |
 | `after` / `before` | | Place a **new** key next to this sibling key. Existing keys are never moved. |
-| `edits` | | List of edits (each with `key`, `value`, `value_type`, `state`, `create`, `after`, `before`) applied in one write. |
+| `rename_to` | | Rename the key, keeping its value and position. Nothing happens when the key doesn't exist (already renamed). |
+| `edits` | | List of edits (each with `key`, `value`, `value_type`, `state`, `create`, `after`, `before`, `rename_to`) applied in one write. |
 
 Returned values: `changed`, `method`, `key`, `value`, `previous_value`,
 `existed`, or `results` (one entry per edit) when `edits` is used.
@@ -237,6 +271,12 @@ Returned values: `changed`, `method`, `key`, `value`, `previous_value`,
       name: metrics
     state: absent
 
+- name: Add a member to a list inside the item named "web"
+  checkthesource.yaml_tools.yaml_list:
+    path: /etc/myapp/groups.yaml
+    key: groups[name=web].members
+    item: alice
+
 - name: Insert a task at the top of a task file (the document itself is a list)
   checkthesource.yaml_tools.yaml_list:
     path: roles/web/tasks/main.yml
@@ -262,20 +302,122 @@ Without `identify_by`, an item matches only when it is exactly equal, so a
 changed dictionary would be added as a new item. Use `identify_by` for lists of
 dictionaries.
 
+With `identify_by`, the matching item is replaced as a whole. To change a
+single field of an item and leave the others alone, use `yaml_edit` with a
+selector, for example `key: users[name=alice].shell`.
+
 Returned values: `changed`, `method`, `action` (`added`, `created`, `updated`,
 `removed` or `unchanged`), `index`, and `removed` (with `state: absent`).
 
+## yaml_merge: merge a dictionary
+
+```yaml
+- name: Apply a block of settings (only the differences are written)
+  checkthesource.yaml_tools.yaml_merge:
+    path: /etc/myapp/config.yaml
+    key: server
+    value:
+      port: 8080
+      tls:
+        enabled: true
+        certificate: /etc/ssl/myapp.pem
+
+- name: Add hosts without removing the existing ones
+  checkthesource.yaml_tools.yaml_merge:
+    path: /etc/myapp/config.yaml
+    value:
+      allowed_hosts: [10.0.0.5, 10.0.0.6]
+    list_merge: append
+```
+
+```diff
+ server:
+-  port: 80          # public port
++  port: 8080          # public port
+   tls:
+-    enabled: false
++    enabled: true
++    certificate: /etc/ssl/myapp.pem
+```
+
+The merge works like the `combine` filter with `recursive=true`: missing keys
+are added, nested dictionaries are merged, other values are replaced, and keys
+of the file that aren't in `value` are kept. Each change is a small verified
+edit, so the rest of the file doesn't move.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `key` | document root | Key path of the mapping to merge into. Created when missing. |
+| `value` | *required* | The dictionary to merge. |
+| `list_merge` | `replace` | When both sides hold a list: `replace` it, `keep` it, or add the missing items with `append` or `prepend`. Items are never added twice. |
+| `create` | `true` | Create the mapping at `key` when it doesn't exist. |
+
+Returned values: `changed`, `method`, `changes` (the key paths that were added
+or changed).
+
+## yaml_info: read a value
+
+```yaml
+- name: Read the replicas of a Deployment
+  checkthesource.yaml_tools.yaml_info:
+    path: app.yaml
+    document:
+      kind: Deployment
+    key: spec.replicas
+  register: replicas
+
+- name: Check it
+  ansible.builtin.assert:
+    that:
+      - replicas.exists
+      - replicas.value >= 2
+```
+
+It replaces the `slurp` + `b64decode` + `from_yaml` combination, with the same
+key paths and selectors as the other modules. A missing key isn't an error:
+`exists` is `false`.
+
+Options: `path`, `key` (omit it for the whole document), `document`,
+`yaml_version`. Returned values: `exists`, `value`, `type` (`str`, `int`,
+`float`, `bool`, `null`, `dict`, `list`, `timestamp`), `document` (the index
+that was read) and `documents` (how many the file has).
+
 ## Common options
+
+These options are shared by `yaml_edit`, `yaml_list` and `yaml_merge`
+(`yaml_info` takes `path`, `document` and `yaml_version`).
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `path` | *required* | YAML file to edit. It must exist. Symbolic links are followed. Alias: `dest`. |
-| `document` | `0` | Document to edit in a multi-document file. |
+| `document` | `0` | Document to edit in a multi-document file: its index, or a dictionary of fields such as `{kind: Deployment, metadata.name: web}` that must match a single document. |
+| `infer_types` | `true` | Write strings that are plainly integers or booleans (`"8080"`, `"true"`) as numbers and booleans. See [Templated values](#templated-values). |
 | `edit_mode` | `auto` | See [Edit modes](#edit-modes). |
 | `yaml_version` | `1.2` | How to read values such as `yes` or `0777`. See [YAML versions](#yaml-versions). |
 | `backup` | `false` | Keep a timestamped copy of the original file. |
 | `validate` | | Command run on the new file before it replaces the original. `%s` is the file path. |
 | `owner`, `group`, `mode`, … | | The standard file attributes, as in `ansible.builtin.file`. |
+
+### Templated values
+
+Before ansible-core 2.19, Ansible renders every templated number as a string:
+`port: "{{ app_port }}"` reaches the module as `"8080"`, even with `| int`.
+Written as is, it would become `port: '8080'` in the file, and it would not be
+recognised as equal to an existing `port: 8080`, so `yaml_list` would add a
+duplicate item.
+
+With `infer_types: true` (the default), such strings are converted before
+they are written or compared:
+
+| Given | Written as |
+| --- | --- |
+| `"8080"`, `"0"`, `"-7"` | `8080`, `0`, `-7` |
+| `"true"`, `"False"` | `true`, `false` |
+| `"0755"`, `"1.10"`, `"yes"`, `"1e3"` and any other string | a string, unchanged |
+
+Floats are never inferred, because `"1.10"` is more often a version than a
+number. To force a type, use `value_type` with `yaml_edit`. To write such
+strings as strings, set `infer_types: false`.
 
 ## How it works
 
@@ -325,6 +467,8 @@ YAML 1.1 (used by Ansible and PyYAML) reads `yes`, `on`, `y` as booleans and
 - Keys inherited through a merge key (`<<: *base`) can be overridden (a local
   key is added) but not removed.
 - `yaml_edit` never creates list items; use `yaml_list`.
+- Selectors look at the fields written in each item. Fields inherited through
+  a merge key (`<<`) are not considered.
 - Keys created by the modules are always strings.
 - Existing keys and items are never moved by `after`, `before`, `position` or
   `index`; these options only place new ones.
@@ -351,6 +495,11 @@ YAML 1.1 (used by Ansible and PyYAML) reads `yes`, `on`, `y` as booleans and
 - **The diff and the returned values do contain file content.** Add
   `no_log: true` to tasks that handle secrets, or run them without `--diff`.
 
+Releases are built, tested and published to Galaxy by a GitHub Actions
+workflow, and each publication needs a maintainer's approval. The tarball and
+its SHA-256 checksum are attached to every
+[GitHub release](https://github.com/checkthesource/ansible-yaml-tools/releases).
+
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Development
@@ -369,66 +518,6 @@ ansible-lint --profile production     # best practices
 
 The editing engine lives in `plugins/module_utils/yaml_core.py`. It works on
 strings and never touches the filesystem, which keeps it easy to test.
-
-## Releasing
-
-Releases are published to Ansible Galaxy by the
-[`release.yml`](.github/workflows/release.yml) workflow when a version tag is
-pushed.
-
-### One-time setup
-
-1. On [galaxy.ansible.com](https://galaxy.ansible.com), sign in with GitHub,
-   make sure you own the namespace used in `galaxy.yml`, then copy your API
-   token from **Collections → API Token**.
-2. In the GitHub repository, go to **Settings → Environments → New
-   environment** and create an environment named `galaxy`:
-   - **Required reviewers:** add yourself, so every publication waits for
-     your approval.
-   - **Deployment branches and tags:** choose *Selected branches and tags* and
-     add the tag rule `v*`.
-   - **Environment secrets:** add `GALAXY_API_KEY` with the Galaxy token.
-3. Optionally, protect `v*` tags under **Settings → Rules → Rulesets** so
-   that only maintainers can create them.
-
-### Publishing a version
-
-1. Make sure every change since the last release has a changelog fragment in
-   `changelogs/fragments/` (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-2. Update `version` in `galaxy.yml`, then generate the changelog:
-
-   ```bash
-   antsibull-changelog release --version 1.1.0
-   ```
-
-3. Commit, then tag and push:
-
-   ```bash
-   git tag v1.1.0
-   git push origin v1.1.0
-   ```
-
-4. The workflow runs the tests, checks that the tag matches `galaxy.yml`,
-   builds the collection and waits for your approval in the **Actions** tab.
-   Once approved, it publishes to Galaxy and creates the GitHub release.
-
-Galaxy does not accept the same version twice, so every release needs a new
-version number.
-
-### How the token is protected
-
-- It is stored in the `galaxy` environment, which only runs for `v*` tags and
-  after approval. Workflows from forks and pull requests never see it.
-- Only the publish job can read it, and that job doesn't check out or run
-  any repository code. It only uploads the tarball built and tested by the
-  previous jobs, after verifying its checksum.
-- The token is passed through ansible-galaxy's configuration variables, never
-  on a command line, and is masked in logs.
-- Workflows use the minimum `GITHUB_TOKEN` permissions, and only GitHub's own
-  actions, pinned by commit SHA and kept up to date by Dependabot.
-
-If the token ever leaks, generate a new one on Galaxy (the old one stops
-working) and update the environment secret.
 
 ## License
 

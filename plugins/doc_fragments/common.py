@@ -22,9 +22,17 @@ options:
     aliases: [dest]
   document:
     description:
-      - Index of the document to edit in a multi-document file (documents
-        separated by C(---)). The first document is V(0).
-    type: int
+      - The document to edit in a multi-document file (documents separated by
+        C(---)).
+      - "Either its index, V(0) being the first document, or a dictionary of
+        fields that identifies it, for example
+        V({kind: Deployment, metadata.name: web}). Field names are key paths and
+        values are compared as text."
+      - A dictionary must match exactly one document, otherwise the task fails.
+        It is resolved once, before the first edit, so edits that change those
+        fields still apply to the same document.
+      - Dictionaries are supported since version 1.1.0.
+    type: raw
     default: 0
   edit_mode:
     description:
@@ -56,6 +64,27 @@ options:
         get the original file back if you somehow clobbered it incorrectly.
     type: bool
     default: false
+  infer_types:
+    description:
+      - Write strings that are plainly integers or booleans as integers and
+        booleans, for example C("8080") as C(8080) and C("true") as C(true).
+      - "Before ansible-core 2.19, Ansible turns every templated number into a
+        string, so C(port: \"{{ app_port }}\") reaches the module as C(\"8080\")
+        even with C(| int). Without this option the value would be written as the
+        quoted string C('8080'), and would not match an existing C(8080)."
+      - Only decimal integers without leading zeros (C(0), C(42), C(-7)) and
+        C(true)/C(false) in any of their usual cases are converted. C(\"0755\"),
+        C(\"1.10\"), C(\"yes\") and every other string are kept as strings.
+        Floats are never inferred, because C(\"1.10\") is more often a version
+        than a number.
+      - Applies to the values written and to the values used to find list items.
+        Dictionary keys are never converted.
+      - Set V(false) to write such strings as strings (quoted). With
+        M(checkthesource.yaml_tools.yaml_edit), an explicit C(value_type) also
+        takes precedence.
+    type: bool
+    default: true
+    version_added: 1.1.0
   validate:
     description:
       - Command used to validate the new file before it replaces the original.

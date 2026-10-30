@@ -32,3 +32,42 @@ releases:
     fragments:
     - 1.0.1.yml
     release_date: '2026-10-30'
+  1.1.0:
+    changes:
+      bugfixes:
+      - yaml_edit, yaml_list - before ansible-core 2.19, templated numbers such as
+        ``"{{ port }}"`` reach modules as strings, even with ``| int``. They were
+        written as quoted strings (``'8080'``), and ``yaml_list`` did not recognise
+        them as equal to existing numbers, so it added duplicate items. They are now
+        written as numbers. Set ``infer_types`` to ``false`` to keep the previous
+        behaviour.
+      minor_changes:
+      - 'document - the ``document`` option of every module accepts a dictionary of
+        fields, such as ``{kind: Deployment, metadata.name: web}``, that must match
+        a single document of a multi-document file.'
+      - key paths - select a list item by the value of one or more of its fields,
+        for example ``users[name=alice].shell`` or ``containers[name=web,image="nginx:1.27"]``,
+        in every module. In the list form of ``key``, a dictionary is a selector.
+      - yaml_edit - add the ``rename_to`` option, also available in ``edits``, to
+        rename a key while keeping its value, its comments and its position.
+      - yaml_edit, yaml_list, yaml_merge - add the ``infer_types`` option (default
+        ``true``), which writes strings that are plainly integers or booleans as integers
+        and booleans.
+      release_summary: 'Select list items and documents by their content, rename keys,
+        merge
+
+        dictionaries with the new ``yaml_merge`` module and read values with the new
+
+        ``yaml_info`` module. Templated numbers are now written as numbers.
+
+        '
+    fragments:
+    - 1.1.0.yml
+    modules:
+    - description: Read a value from a YAML file on the managed node.
+      name: yaml_info
+      namespace: ''
+    - description: Merge a dictionary into a YAML file without reformatting it.
+      name: yaml_merge
+      namespace: ''
+    release_date: '2026-10-30'

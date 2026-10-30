@@ -36,9 +36,20 @@ options:
       - "Keys containing dots or brackets can be quoted in brackets,
         for example V(annotations[\"example.com/owner\"]). A dot can also be
         escaped with a backslash: V(a\\\\.b)."
-      - "As a list: one item per level, strings for mapping keys and integers
-        for list indexes, for example V([\"annotations\", \"example.com/owner\"])
-        or V([\"ports\", 0]). This form never needs escaping."
+      - "An item of a list of dictionaries can be chosen by the value of one of
+        its fields instead of its index: V(users[name=alice].shell) is the
+        C(shell) of the item whose C(name) is C(alice). Several conditions are
+        separated by commas, fields can be nested, and values can be quoted:
+        V(containers[name=web,image=\"nginx:1.27\"].ports)."
+      - "A selector must match exactly one item: the task fails when several
+        items match, and also when none does, except with O(state=absent) or
+        O(rename_to), where there is then nothing to do. Values are compared as
+        text, like keys, so V([port=80]) matches C(port: 80) and C(port: '80')."
+      - "As a list: one item per level, strings for mapping keys, integers
+        for list indexes and dictionaries for selectors, for example
+        V([\"annotations\", \"example.com/owner\"]), V([\"ports\", 0]) or
+        V([\"users\", {\"name\": \"alice\"}, \"shell\"]). Mapping keys
+        in this form never need escaping."
       - Keys are matched by their text, so V(ports.80) matches both C(80:) and C('80':).
       - Required unless O(edits) is used.
     type: raw
@@ -46,12 +57,15 @@ options:
     description:
       - The value to set when O(state=present). It can be a string, number,
         boolean, list or dictionary.
-      - Required when O(state=present), unless O(value_type=null).
+      - Required when O(state=present), unless O(value_type=null) or
+        O(rename_to) is used.
     type: raw
   value_type:
     description:
       - Convert O(value) to this type before writing it.
-      - V(raw) keeps the value exactly as Ansible passes it.
+      - V(raw) keeps the value as Ansible passes it, except that strings that
+        are plainly integers or booleans are written as such when O(infer_types=true)
+        (the default).
       - "Useful when a templated value arrives as a string, for example
         C(value: \"{{ port }}\") with O(value_type=int)."
       - V(null) writes a YAML null. O(value) must then be omitted or null.
@@ -85,12 +99,25 @@ options:
       - When the key is created, place it right before this sibling key.
       - Same rules as O(after).
     type: str
+  rename_to:
+    description:
+      - Rename the key at O(key) to this name. Its value, its comments and its
+        position in the mapping are kept.
+      - This is the new name of the key only, not a path; the key stays in the
+        same mapping.
+      - Nothing changes when O(key) does not exist, for example because it has
+        already been renamed. The task fails when a key with the new name
+        already exists.
+      - Mutually exclusive with O(value), O(after), O(before), O(state=absent)
+        and O(value_type) other than V(raw).
+    type: str
+    version_added: 1.1.0
   edits:
     description:
       - A list of edits applied in order, in a single read, verification and
         write of the file.
       - Each item takes the same options as the module itself.
-      - Mutually exclusive with O(key), O(value), O(after) and O(before).
+      - Mutually exclusive with O(key), O(value), O(after), O(before) and O(rename_to).
     type: list
     elements: dict
     suboptions:
@@ -121,6 +148,10 @@ options:
       before:
         description: Sibling key to place a new key before, see O(before).
         type: str
+      rename_to:
+        description: New name of the key, see O(rename_to).
+        type: str
+        version_added: 1.1.0
 extends_documentation_fragment:
   - ansible.builtin.files
   - checkthesource.yaml_tools.common
@@ -130,6 +161,8 @@ notes:
   - Keys created by this module are always strings.
 seealso:
   - module: checkthesource.yaml_tools.yaml_list
+  - module: checkthesource.yaml_tools.yaml_merge
+  - module: checkthesource.yaml_tools.yaml_info
   - module: ansible.builtin.lineinfile
   - module: ansible.builtin.replace
 '''
@@ -154,6 +187,33 @@ EXAMPLES = r'''
     key: server.timeout
     value: 30
     after: port
+
+- name: Change the shell of the user named "alice", without touching her other fields
+  checkthesource.yaml_tools.yaml_edit:
+    path: /etc/myapp/users.yaml
+    key: users[name=alice].shell
+    value: /bin/zsh
+
+- name: Change the image of the container named "web"
+  checkthesource.yaml_tools.yaml_edit:
+    path: deployment.yaml
+    key: spec.template.spec.containers[name=web].image
+    value: nginx:1.27
+
+- name: Edit the Deployment named "web" in a file with several manifests
+  checkthesource.yaml_tools.yaml_edit:
+    path: app.yaml
+    document:
+      kind: Deployment
+      metadata.name: web
+    key: spec.replicas
+    value: 3
+
+- name: Rename a key (its value, comments and position are kept)
+  checkthesource.yaml_tools.yaml_edit:
+    path: /etc/myapp/config.yaml
+    key: server.listen
+    rename_to: bind
 
 - name: Use a key that contains dots
   checkthesource.yaml_tools.yaml_edit:
@@ -222,18 +282,24 @@ method:
   type: str
   sample: lossless
 key:
-  description: The key path, split into its parts.
+  description:
+    - The key path, split into its parts.
+    - 'Selectors are returned as dictionaries, for example C({"name": "web"}).'
   returned: when O(edits) is not used
   type: list
   elements: raw
   sample: ["server", "port"]
 value:
-  description: The value that was written, after O(value_type) conversion. Null when O(state=absent).
+  description:
+    - The value that was written, after O(value_type) conversion.
+    - Null when O(state=absent) or O(rename_to) is used.
   returned: when O(edits) is not used
   type: raw
   sample: 8080
 previous_value:
-  description: The value before the edit. Null when the key did not exist.
+  description:
+    - The value before the edit. Null when the key did not exist.
+    - With O(rename_to), the value of the renamed key.
   returned: when O(edits) is not used
   type: raw
   sample: 80
@@ -259,7 +325,7 @@ results:
       description: V(lossless), V(roundtrip), or null when this edit changed nothing.
       type: str
     value:
-      description: The value written, or null when removing.
+      description: The value written, or null when removing or renaming.
       type: raw
     previous_value:
       description: The value before this edit.
@@ -289,7 +355,11 @@ from ansible_collections.checkthesource.yaml_tools.plugins.module_utils.yaml_cor
     common_argument_spec,
     convert_value,
     edit_yaml_text,
+    infer_types,
     parse_key,
+    parts_to_json,
+    rename_key_text,
+    resolve_document,
     run_file_edit,
 )
 
@@ -301,17 +371,30 @@ EDIT_OPTIONS = dict(
     create=dict(type='bool', default=True),
     after=dict(type='str'),
     before=dict(type='str'),
+    rename_to=dict(type='str'),
 )
 
 
-def prepare_edit(options):
+def prepare_edit(options, infer=False):
     """Validate one edit and return (key parts, value)."""
     parts = parse_key(options['key'])
     value = None
-    if options['state'] == 'present':
+    if options['rename_to'] is not None:
+        conflicts = [name for name in ('value', 'after', 'before') if options[name] is not None]
+        if options['state'] == 'absent':
+            conflicts.append('state=absent')
+        if options['value_type'] != 'raw':
+            conflicts.append('value_type')
+        if conflicts:
+            raise YamlEditError('rename_to cannot be used with %s' % ', '.join(conflicts))
+        if not options['rename_to']:
+            raise YamlEditError('rename_to must not be empty')
+    elif options['state'] == 'present':
         if options['value'] is None and options['value_type'] != 'null':
             raise YamlEditError('value is required when state=present (use value_type=null to write null)')
         value = convert_value(options['value'], options['value_type'])
+        if infer and options['value_type'] == 'raw':
+            value = infer_types(value)
     elif options['after'] is not None or options['before'] is not None:
         raise YamlEditError('after and before can only be used with state=present')
     if options['after'] is not None and options['before'] is not None:
@@ -330,7 +413,7 @@ def main():
         argument_spec=argument_spec,
         add_file_common_args=True,
         supports_check_mode=True,
-        mutually_exclusive=[('edits', name) for name in ('key', 'value', 'after', 'before')],
+        mutually_exclusive=[('edits', name) for name in ('key', 'value', 'after', 'before', 'rename_to')],
         required_one_of=[('key', 'edits')],
     )
     params = module.params
@@ -341,27 +424,34 @@ def main():
         if batch:
             if not params['edits']:
                 raise YamlEditError('edits must not be empty')
-            prepared = [prepare_edit(options) + (options,) for options in params['edits']]
+            prepared = [prepare_edit(options, params['infer_types']) + (options,) for options in params['edits']]
         else:
-            prepared = [prepare_edit(params) + (params,)]
-            result['key'] = prepared[0][0]
+            prepared = [prepare_edit(params, params['infer_types']) + (params,)]
+            result['key'] = parts_to_json(prepared[0][0])
     except YamlEditError as e:
         module.fail_json(msg=str(e), **result)
 
     def edit(text):
         results = []
+        # Resolved once, so that every edit works on the same document.
+        document = resolve_document(text, params['document'], params['yaml_version'])
+        common = dict(document=document, edit_mode=params['edit_mode'], yaml_version=params['yaml_version'])
         for number, (parts, value, options) in enumerate(prepared):
             try:
-                res = edit_yaml_text(
-                    text, parts, state=options['state'], value=value, document=params['document'],
-                    edit_mode=params['edit_mode'], yaml_version=params['yaml_version'],
-                    create=options['create'], after=options['after'], before=options['before'])
+                if options['rename_to'] is not None:
+                    res = rename_key_text(text, parts, options['rename_to'], **common)
+                    res.info['previous'] = res.info['value']
+                    res.info['value'] = None
+                else:
+                    res = edit_yaml_text(
+                        text, parts, state=options['state'], value=value, create=options['create'],
+                        after=options['after'], before=options['before'], **common)
             except YamlEditError as e:
                 if batch:
                     raise YamlEditError('edits[%d] (%s): %s' % (number, options['key'], e))
                 raise
             text = res.text
-            results.append(dict(key=parts, changed=res.changed, method=res.method, value=res.info['value'],
+            results.append(dict(key=parts_to_json(parts), changed=res.changed, method=res.method, value=res.info['value'],
                                 previous_value=res.info['previous'], existed=res.info['existed']))
         if batch:
             result['results'] = results

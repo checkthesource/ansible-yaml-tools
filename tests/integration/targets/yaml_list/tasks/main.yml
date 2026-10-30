@@ -195,3 +195,120 @@
       ansible.builtin.file:
         path: "{{ workdir.path }}"
         state: absent
+
+# --- 1.1.0: templated numbers and selectors in the key ------------------------
+- name: Create a work directory for the 1.1.0 tests
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_list_110
+  register: workdir110
+
+- name: Run the 1.1.0 tests
+  vars:
+    entries_file: "{{ workdir110.path }}/entries.yaml"
+    # Strings, as values from -e, prompts or templates are before ansible-core 2.19.
+    entry_name: third
+    entry_number: "1104"
+    existing_number: "4001"
+  block:
+    - name: Write the test file
+      ansible.builtin.copy:
+        dest: "{{ entries_file }}"
+        mode: "0644"
+        content: |
+          entries:
+            - name: first
+              number: 4001
+          groups:
+            - name: web
+              members:
+                - bob
+
+    - name: An item given with a templated number matches the existing one
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: entries
+        item:
+          name: first
+          number: "{{ existing_number }}"
+      register: same
+
+    - name: Add an item with a templated number
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: entries
+        item:
+          name: "{{ entry_name }}"
+          number: "{{ entry_number }}"
+      register: added
+
+    - name: Add it again
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: entries
+        item:
+          name: "{{ entry_name }}"
+          number: "{{ entry_number }}"
+      register: added_again
+
+    - name: Add a member to the group named web
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: groups[name=web].members
+        item: alice
+      register: member
+
+    - name: A list under a missing item cannot be created
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: groups[name=db].members
+        item: alice
+      register: no_group
+      ignore_errors: true
+
+    - name: Keep a templated number as a string when asked
+      checkthesource.yaml_tools.yaml_list:
+        path: "{{ entries_file }}"
+        key: entries
+        item:
+          name: as-string
+          number: "{{ entry_number }}"
+        infer_types: false
+      register: as_string
+
+    - name: Read the file
+      ansible.builtin.slurp:
+        src: "{{ entries_file }}"
+      register: entries_content
+
+    - name: Check the results
+      vars:
+        content: "{{ entries_content.content | b64decode }}"
+        expected: |
+          entries:
+            - name: first
+              number: 4001
+            - name: third
+              number: 1104
+            - name: as-string
+              number: '1104'
+          groups:
+            - name: web
+              members:
+                - bob
+                - alice
+      ansible.builtin.assert:
+        that:
+          - same is not changed
+          - added is changed
+          - added_again is not changed
+          - member is changed
+          - no_group is failed
+          - "'no item of groups matches' in no_group.msg"
+          - content == expected
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir110.path }}"
+        state: absent

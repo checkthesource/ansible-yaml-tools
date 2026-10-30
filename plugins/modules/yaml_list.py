@@ -26,6 +26,10 @@ description:
     updated or removed item change. New items follow the indentation of the
     existing ones."
   - To set or remove values in mappings, use M(checkthesource.yaml_tools.yaml_edit).
+    To change a single field of a list item, for example the C(image) of the
+    container named C(web), use M(checkthesource.yaml_tools.yaml_edit) with a
+    selector such as V(containers[name=web].image) instead of replacing the
+    whole item.
 author:
   - checkthesource (@checkthesource)
 options:
@@ -34,6 +38,9 @@ options:
       - Path of the list, with the same syntax as the C(key) option of
         M(checkthesource.yaml_tools.yaml_edit), for example V(server.tags) or
         V(spec.template.spec.containers).
+      - "The path can go through list items chosen by a field, for example
+        V(groups[name=web].members) for the C(members) list of the group named
+        C(web)."
       - Omit it when the document itself is a list (for example a task file).
     type: raw
   item:
@@ -55,7 +62,8 @@ options:
         V([name]). O(item) must be a dictionary that contains them.
       - "With O(state=present): when an item with the same values for these
         fields exists, it is replaced by O(item) if it differs, and nothing
-        changes otherwise. When none exists, O(item) is added."
+        changes otherwise. When none exists, O(item) is added. The whole item is
+        replaced, so fields missing from O(item) are removed."
       - With O(state=absent), every item with the same values for these
         fields is removed, whatever its other fields.
       - Without this option, an item matches only when it is exactly equal
@@ -101,6 +109,7 @@ extends_documentation_fragment:
   - checkthesource.yaml_tools.common
 seealso:
   - module: checkthesource.yaml_tools.yaml_edit
+  - module: checkthesource.yaml_tools.yaml_merge
 '''
 
 EXAMPLES = r'''
@@ -138,6 +147,12 @@ EXAMPLES = r'''
     item:
       name: metrics
     state: absent
+
+- name: Add a member to the group named "web"
+  checkthesource.yaml_tools.yaml_list:
+    path: /etc/myapp/groups.yaml
+    key: groups[name=web].members
+    item: alice
 
 - name: Insert a task at a given position in a task file (the document is a list)
   checkthesource.yaml_tools.yaml_list:
@@ -194,8 +209,10 @@ from ansible_collections.checkthesource.yaml_tools.plugins.module_utils.yaml_cor
     YamlEditError,
     common_argument_spec,
     ensure_list_item,
+    infer_types,
     parse_key,
     remove_list_items,
+    resolve_document,
     run_file_edit,
 )
 
@@ -221,8 +238,6 @@ def main():
     )
     params = module.params
     result = {}
-    common = dict(document=params['document'], edit_mode=params['edit_mode'],
-                  yaml_version=params['yaml_version'])
 
     try:
         parts = parse_key(params['key'], allow_empty=True)
@@ -234,14 +249,21 @@ def main():
     except YamlEditError as e:
         module.fail_json(msg=str(e))
 
+    def convert(value):
+        return infer_types(value) if params['infer_types'] else value
+
     def edit(text):
+        common = dict(document=resolve_document(text, params['document'], params['yaml_version']),
+                      edit_mode=params['edit_mode'], yaml_version=params['yaml_version'])
         if params['state'] == 'present':
-            res = ensure_list_item(text, parts, params['item'], identify_by=params['identify_by'],
-                                   position=params['position'], index=params['index'], after=params['after'],
-                                   before=params['before'], create=params['create'], **common)
+            res = ensure_list_item(text, parts, convert(params['item']), identify_by=params['identify_by'],
+                                   position=params['position'], index=params['index'],
+                                   after=convert(params['after']), before=convert(params['before']),
+                                   create=params['create'], **common)
             result['index'] = res.info['index']
         else:
-            res = remove_list_items(text, parts, params['item'], identify_by=params['identify_by'], **common)
+            res = remove_list_items(text, parts, convert(params['item']), identify_by=params['identify_by'],
+                                    **common)
             result['removed'] = res.info['removed']
         result['action'] = res.info['action']
         return res

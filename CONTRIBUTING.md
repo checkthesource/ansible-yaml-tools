@@ -79,3 +79,19 @@ The sections are `major_changes`, `minor_changes`, `breaking_changes`,
 `known_issues`. Check fragments with `antsibull-changelog lint`.
 
 New options and modules need `version_added` set to the next release.
+
+## Releasing (maintainers)
+
+Releases are published by the [`release.yml`](.github/workflows/release.yml)
+workflow when a `vX.Y.Z` tag is pushed. The Galaxy token is stored only in the
+`galaxy` environment, which accepts `v*` tags and requires a reviewer.
+
+1. Check that every user-visible change has a changelog fragment.
+2. Set `version` in `galaxy.yml`, then run
+   `antsibull-changelog release --version X.Y.Z`.
+3. Commit, then push a signed tag: `git tag -s vX.Y.Z -m vX.Y.Z` and
+   `git push origin vX.Y.Z`.
+4. Approve the *Publish to Ansible Galaxy* job in the **Actions** tab.
+
+Galaxy never accepts the same version twice: if a release fails after the tag
+was pushed, fix the problem and release the next patch version.

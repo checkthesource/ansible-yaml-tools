@@ -318,3 +318,141 @@
       ansible.builtin.file:
         path: "{{ workdir.path }}"
         state: absent
+
+# --- 1.1.0: selectors, documents chosen by content, renaming, infer_types ----
+- name: Create a work directory for the 1.1.0 tests
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_edit_110
+  register: workdir110
+
+- name: Run the 1.1.0 tests
+  vars:
+    users: "{{ workdir110.path }}/users.yaml"
+    manifests: "{{ workdir110.path }}/app.yaml"
+    replicas: "3"
+  block:
+    - name: Write the test files
+      ansible.builtin.copy:
+        dest: "{{ item.dest }}"
+        content: "{{ item.content }}"
+        mode: "0644"
+      loop:
+        - dest: "{{ users }}"
+          content: |
+            users:
+              - name: alice   # admin
+                shell: /bin/bash
+                uid: 1000
+              - name: bob
+                shell: /bin/sh
+                uid: 1001
+            listen: 0.0.0.0
+        - dest: "{{ manifests }}"
+          content: |
+            kind: Service
+            metadata:
+              name: web
+            ---
+            kind: Deployment
+            metadata:
+              name: web
+            spec:
+              replicas: 1   # scaled
+      loop_control:
+        label: "{{ item.dest | basename }}"
+
+    - name: Change one field of the item named alice
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ users }}"
+        key: users[name=alice].shell
+        value: /bin/zsh
+      register: shell
+
+    - name: Several edits through selectors, a templated number and a rename
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ users }}"
+        edits:
+          - key: users[name=bob].uid
+            value: "{{ 1002 }}"
+          - key: ["users", {"name": "bob"}, "groups"]
+            value: [wheel]
+          - key: listen
+            rename_to: bind
+      register: batch
+
+    - name: Rename again (nothing to do)
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ users }}"
+        key: listen
+        rename_to: bind
+      register: rename_again
+
+    - name: A selector that matches nothing is an error when setting
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ users }}"
+        key: users[name=carol].shell
+        value: /bin/sh
+      register: no_carol
+      ignore_errors: true
+
+    - name: Edit the Deployment chosen by its fields
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ manifests }}"
+        document:
+          kind: Deployment
+          metadata.name: web
+        key: spec.replicas
+        value: "{{ replicas }}"
+      register: scaled
+
+    - name: A document selector must match a single document
+      checkthesource.yaml_tools.yaml_edit:
+        path: "{{ manifests }}"
+        document:
+          metadata.name: web
+        key: spec.replicas
+        value: 1
+      register: ambiguous
+      ignore_errors: true
+
+    - name: Read the files
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: ["{{ users }}", "{{ manifests }}"]
+      register: contents
+
+    - name: Check the results
+      vars:
+        users_content: "{{ contents.results[0].content | b64decode }}"
+        manifests_content: "{{ contents.results[1].content | b64decode }}"
+        users_expected: |
+          users:
+            - name: alice   # admin
+              shell: /bin/zsh
+              uid: 1000
+            - name: bob
+              shell: /bin/sh
+              uid: 1002
+              groups:
+                - wheel
+          bind: 0.0.0.0
+      ansible.builtin.assert:
+        that:
+          - shell is changed and shell.previous_value == '/bin/bash'
+          - batch is changed
+          - batch.results | map(attribute='changed') | list == [true, true, true]
+          - rename_again is not changed and not rename_again.existed
+          - no_carol is failed
+          - "'no item of users matches [name=carol]' in no_carol.msg"
+          - scaled is changed and scaled.value == 3
+          - ambiguous is failed
+          - "'documents 0, 1 all match' in ambiguous.msg"
+          - users_content == users_expected
+          - "'  replicas: 3   # scaled' in manifests_content"
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir110.path }}"
+        state: absent

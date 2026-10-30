@@ -1,0 +1,95 @@
+---
+# Integration tests for yaml_info.
+# Run with: ansible-test integration yaml_info
+
+- name: Create a work directory
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_info
+  register: workdir
+
+- name: Run the tests
+  vars:
+    config: "{{ workdir.path }}/config.yaml"
+    original: |
+      server:
+        port: 8080
+        debug: no
+      users:
+        - name: alice
+          shell: /bin/zsh
+      ---
+      kind: Deployment
+      spec:
+        replicas: 2
+  block:
+    - name: Write the test file
+      ansible.builtin.copy:
+        dest: "{{ config }}"
+        content: "{{ original }}"
+        mode: "0644"
+
+    - name: Read a value
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ config }}"
+        key: server.port
+      register: server_port
+
+    - name: Read a missing value
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ config }}"
+        key: server.missing
+      register: missing
+
+    - name: Read a value with YAML 1.1 rules
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ config }}"
+        key: server.debug
+        yaml_version: "1.1"
+      register: debug
+
+    - name: Read through a selector
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ config }}"
+        key: users[name=alice].shell
+      register: shell
+
+    - name: Read from a document chosen by its fields
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ config }}"
+        document:
+          kind: Deployment
+        key: spec.replicas
+      register: replicas
+      check_mode: true
+
+    - name: A missing file is an error
+      checkthesource.yaml_tools.yaml_info:
+        path: "{{ workdir.path }}/nope.yaml"
+      register: no_file
+      ignore_errors: true
+
+    - name: Read the file again
+      ansible.builtin.slurp:
+        src: "{{ config }}"
+      register: config_content
+
+    - name: Check the results
+      ansible.builtin.assert:
+        that:
+          - server_port is not changed
+          - server_port.exists and server_port.value == 8080 and server_port.type == 'int'
+          - server_port.document == 0 and server_port.documents == 2
+          - not missing.exists and missing.value is none and missing.type is none
+          - debug.value is false and debug.type == 'bool'
+          - shell.value == '/bin/zsh'
+          - replicas.value == 2 and replicas.document == 1
+          - no_file is failed
+          - "'does not exist' in no_file.msg"
+          - (config_content.content | b64decode) == original
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir.path }}"
+        state: absent

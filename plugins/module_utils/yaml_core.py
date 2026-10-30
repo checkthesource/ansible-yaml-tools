@@ -80,11 +80,12 @@ def common_argument_spec():
     """Options shared by every module of the collection (see the ``common`` doc fragment)."""
     return dict(
         path=dict(type='path', required=True, aliases=['dest']),
-        document=dict(type='int', default=0),
+        document=dict(type='raw', default=0),
         edit_mode=dict(type='str', default='auto', choices=['auto', 'lossless', 'roundtrip']),
         yaml_version=dict(type='str', default='1.2', choices=['1.1', '1.2']),
         backup=dict(type='bool', default=False),
         validate=dict(type='str'),
+        infer_types=dict(type='bool', default=True),
     )
 
 
@@ -92,8 +93,94 @@ def common_argument_spec():
 # Key path parsing
 # ---------------------------------------------------------------------------
 
+class Selector(object):
+    """A list item chosen by the values of some of its fields, written ``[name=web]``.
+
+    ``conditions`` is a list of ``(field, text)``: ``field`` is a list of
+    mapping keys (``metadata.name`` is ``['metadata', 'name']``) and ``text`` is
+    compared with the text of the scalar found there, the same way keys are
+    matched by their text.
+    """
+
+    def __init__(self, conditions):
+        if not conditions:
+            raise YamlEditError('a selector needs at least one field=value condition')
+        self.conditions = [(list(field), text) for field, text in conditions]
+
+    def __eq__(self, other):
+        return isinstance(other, Selector) and self.conditions == other.conditions
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(tuple((tuple(f), t) for f, t in self.conditions))
+
+    def __repr__(self):
+        return 'Selector(%r)' % (self.conditions,)
+
+    def describe(self):
+        out = []
+        for field, text in self.conditions:
+            if all(re.match(r'^[^.\[\]\\"\'=,]+$', f) for f in field):
+                name = '.'.join(field)
+            elif len(field) == 1:
+                name = _bracket_quote(field[0])
+            else:
+                name = format_key(field)
+            value = text if re.match(r'^[^\s,\]"\'\\][^,\]\\]*(?<=\S)$', text) else _bracket_quote(text)
+            out.append('%s=%s' % (name, value))
+        return '[%s]' % ','.join(out)
+
+    def matches(self, node):
+        """Whether the composed ``node`` is a mapping whose fields have the expected text."""
+        for field, text in self.conditions:
+            current = node
+            for name in field:
+                if not isinstance(current, MappingNode):
+                    return False
+                current = find_key(current, name, allow_merge=True)[1]
+                if current is None:
+                    return False
+            if not isinstance(current, ScalarNode) or current.value != text:
+                return False
+        return True
+
+
+def _bracket_quote(text):
+    return '"%s"' % text.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def _selector_text(value, what):
+    """The text a selector compares with, for a value given as data (list form, document option)."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, int):
+        return str(int(value))
+    if isinstance(value, str):
+        return str(value)
+    raise YamlEditError('%s: selector values must be strings, integers or booleans, got %s'
+                        % (what, 'null' if value is None else type(value).__name__))
+
+
+def selector_from_dict(fields, what='selector'):
+    """Build a Selector from ``{"name": "web", "metadata.name": "x"}``. Field names are key paths."""
+    if not isinstance(fields, dict) or not fields:
+        raise YamlEditError('%s must be a non-empty dictionary of field: value' % what)
+    conditions = []
+    for name, value in fields.items():
+        if not isinstance(name, str):
+            raise YamlEditError('%s: field names must be strings' % what)
+        field = parse_key(str(name))
+        if any(not isinstance(p, str) for p in field):
+            raise YamlEditError('%s: the field %r must be a path of mapping keys, without list indexes'
+                                % (what, name))
+        conditions.append((field, _selector_text(value, '%s.%s' % (what, name))))
+    return Selector(conditions)
+
+
 def parse_key(key, allow_empty=False):
-    """Turn a key path into a list of str (mapping keys) and int (list indexes)."""
+    """Turn a key path into a list of str (mapping keys), int (list indexes) and Selector (list items)."""
     if key is None and allow_empty:
         return []
     if isinstance(key, (list, tuple)):
@@ -109,8 +196,13 @@ def parse_key(key, allow_empty=False):
                 if item == '':
                     raise YamlEditError('key items must not be empty strings')
                 parts.append(str(item))
+            elif isinstance(item, dict):
+                parts.append(selector_from_dict(item, 'key item'))
+            elif isinstance(item, Selector):
+                parts.append(item)
             else:
-                raise YamlEditError('key items must be strings or integers, got %s' % type(item).__name__)
+                raise YamlEditError('key items must be strings, integers or dictionaries (selectors), got %s'
+                                    % type(item).__name__)
         return parts
 
     if not isinstance(key, str):
@@ -169,35 +261,116 @@ def parse_key(key, allow_empty=False):
     return parts
 
 
+def _parse_quoted(key, i, start):
+    """Parse a quoted string starting at ``key[i]`` (a quote). Returns (index after it, text)."""
+    quote = key[i]
+    n = len(key)
+    i += 1
+    buf = []
+    while i < n and key[i] != quote:
+        if key[i] == '\\' and i + 1 < n:
+            buf.append(key[i + 1])
+            i += 2
+            continue
+        buf.append(key[i])
+        i += 1
+    if i >= n:
+        raise YamlEditError('invalid key %r: unterminated quoted string at position %d' % (key, start))
+    return i + 1, ''.join(buf)
+
+
+def _skip_blanks(key, i):
+    while i < len(key) and key[i] == ' ':
+        i += 1
+    return i
+
+
 def _parse_bracket(key, start):
-    """Parse ``[0]``, ``[-1]``, ``["a.b"]`` or ``['a.b']`` starting at ``key[start] == '['``."""
+    """Parse ``[0]``, ``[-1]``, ``["a.b"]``, ``['a.b']`` or a selector such as ``[name=web]``.
+
+    ``key[start]`` is the ``[``. Returns (index after the ``]``, part).
+    """
     i = start + 1
     n = len(key)
     if i < n and key[i] in '"\'':
-        quote = key[i]
-        i += 1
-        buf = []
-        while i < n and key[i] != quote:
-            if key[i] == '\\' and i + 1 < n:
-                buf.append(key[i + 1])
-                i += 2
-                continue
-            buf.append(key[i])
-            i += 1
-        if i >= n or i + 1 >= n or key[i + 1] != ']':
-            raise YamlEditError('invalid key %r: unterminated quoted key at position %d' % (key, start))
-        if not buf:
-            raise YamlEditError('invalid key %r: empty quoted key at position %d' % (key, start))
-        return i + 2, ''.join(buf)
+        end, text = _parse_quoted(key, i, start)
+        if end < n and key[end] == ']':
+            if not text:
+                raise YamlEditError('invalid key %r: empty quoted key at position %d' % (key, start))
+            return end + 1, text
+        if _skip_blanks(key, end) < n and key[_skip_blanks(key, end)] == '=':
+            return _parse_selector(key, start)
+        raise YamlEditError('invalid key %r: expected "]" after the quoted key at position %d' % (key, start))
     end = key.find(']', i)
     if end == -1:
         raise YamlEditError('invalid key %r: missing "]" after position %d' % (key, start))
     text = key[i:end].strip()
-    if not re.match(r'^-?[0-9]+$', text):
-        raise YamlEditError(
-            'invalid key %r: %r is not a list index. Quote mapping keys in brackets, for example ["%s"]'
-            % (key, key[start:end + 1], text))
-    return end + 1, int(text)
+    if re.match(r'^-?[0-9]+$', text):
+        return end + 1, int(text)
+    if '=' in key[i:end]:
+        return _parse_selector(key, start)
+    raise YamlEditError(
+        'invalid key %r: %r is not a list index. Quote mapping keys in brackets, for example ["%s"], '
+        'or select a list item by a field, for example [%s=value]'
+        % (key, key[start:end + 1], text, text))
+
+
+def _parse_selector(key, start):
+    """Parse ``[field=value,other.field="value"]`` starting at ``key[start] == '['``."""
+    n = len(key)
+    i = start + 1
+    conditions = []
+    while True:
+        i = _skip_blanks(key, i)
+        # Field: a quoted mapping key, or dot-separated bare keys.
+        if i < n and key[i] in '"\'':
+            i, name = _parse_quoted(key, i, start)
+            if not name:
+                raise YamlEditError('invalid key %r: empty field name in the selector at position %d'
+                                    % (key, start))
+            field = [name]
+        else:
+            j = i
+            while j < n and key[j] not in '=,]"\'':
+                j += 1
+            raw = key[i:j].strip()
+            field = raw.split('.')
+            if not raw or any(not f.strip() for f in field):
+                raise YamlEditError('invalid key %r: empty field name in the selector at position %d'
+                                    % (key, start))
+            field = [f.strip() for f in field]
+            i = j
+        i = _skip_blanks(key, i)
+        if i >= n or key[i] != '=':
+            raise YamlEditError('invalid key %r: expected "=" after the field %r in the selector at position %d'
+                                % (key, '.'.join(field), start))
+        i = _skip_blanks(key, i + 1)
+        # Value: a quoted string, or bare text up to "," or "]".
+        if i < n and key[i] in '"\'':
+            i, text = _parse_quoted(key, i, start)
+        else:
+            j = i
+            while j < n and key[j] not in ',]':
+                j += 1
+            text = key[i:j].strip()
+            if not text:
+                raise YamlEditError('invalid key %r: empty value in the selector at position %d; '
+                                    'quote it to match an empty value, for example [%s=""]'
+                                    % (key, start, '.'.join(field)))
+            i = j
+        conditions.append((field, text))
+        i = _skip_blanks(key, i)
+        if i < n and key[i] == ',':
+            i += 1
+            continue
+        if i < n and key[i] == ']':
+            return i + 1, Selector(conditions)
+        raise YamlEditError('invalid key %r: expected "," or "]" in the selector at position %d' % (key, start))
+
+
+def parts_to_json(parts):
+    """Key parts as module results: selectors become dictionaries such as {"name": "web"}."""
+    return [dict(('.'.join(f), t) for f, t in p.conditions) if isinstance(p, Selector) else p for p in parts]
 
 
 def format_key(parts):
@@ -205,7 +378,9 @@ def format_key(parts):
         return 'the document root'
     out = []
     for p in parts:
-        if isinstance(p, int):
+        if isinstance(p, Selector):
+            out.append(p.describe())
+        elif isinstance(p, int):
             out.append('[%d]' % p)
         elif re.match(r'^[^.\[\]\\"\']+$', p):
             out.append(('.' if out else '') + p)
@@ -562,8 +737,8 @@ def emit_string(s, prefer=None, flow=False):
     raise YamlEditError('cannot represent the string %r as YAML' % (s,))
 
 
-def emit_key(s):
-    if _plain_candidate_ok(s, False) and _key_loads_as(s, s):
+def emit_key(s, flow=False):
+    if _plain_candidate_ok(s, flow) and _key_loads_as(s, s):
         return s
     for text in (_single_quoted(s), _double_quoted(s)):
         if _key_loads_as(text, s):
@@ -725,6 +900,9 @@ def locate(root, parts):
     node = root
     for i, part in enumerate(parts):
         if isinstance(node, MappingNode):
+            if isinstance(part, Selector):
+                raise YamlEditError('%s is a mapping, but the key path uses the list item selector %s'
+                                    % (_describe(parts, i), part.describe()))
             if isinstance(part, int):
                 raise YamlEditError('%s is a mapping, but the key path uses the list index [%d]'
                                     % (_describe(parts, i), part))
@@ -735,6 +913,18 @@ def locate(root, parts):
                 return loc
             loc.steps.append(Step(node, v, key_node=k))
             node = v
+        elif isinstance(node, SequenceNode) and isinstance(part, Selector):
+            matches = [j for j, item in enumerate(node.value) if part.matches(item)]
+            if len(matches) > 1:
+                raise YamlEditError('%d items of %s match %s (items %s); a selector must match a single item'
+                                    % (len(matches), format_key(parts[:i]) if i else 'the document',
+                                       part.describe(), ', '.join(str(j) for j in matches)))
+            if not matches:
+                loc.missing_at = i
+                loc.missing_reason = 'selector'
+                return loc
+            loc.steps.append(Step(node, node.value[matches[0]], index=matches[0]))
+            node = node.value[matches[0]]
         elif isinstance(node, SequenceNode):
             if not isinstance(part, int):
                 raise YamlEditError('%s is a list, but the key path uses the key %r; use an index such as [0]'
@@ -752,24 +942,38 @@ def locate(root, parts):
             loc.missing_reason = 'null'
             return loc
         else:
-            raise YamlEditError('%s is a scalar value; it has no key %r' % (_describe(parts, i), part))
+            raise YamlEditError('%s is a scalar value; it has no %s'
+                                % (_describe(parts, i), format_key([part]) if not isinstance(part, str)
+                                   else 'key %r' % part))
     return loc
 
 
-def find_key(mapping, name):
+def concrete_parts(parts, loc):
+    """Replace the selectors of ``parts`` by the indexes ``loc`` found, so that later edits address the same item."""
+    out = list(parts)
+    for i, step in enumerate(loc.steps):
+        if isinstance(out[i], Selector) or (isinstance(out[i], int) and out[i] < 0):
+            out[i] = step.index
+    return out
+
+
+def find_key(mapping, name, allow_merge=False):
     """Find the entry whose key text is ``name`` in a MappingNode. Returns (key_node, value_node)."""
     matches = [(k, v) for k, v in mapping.value if isinstance(k, ScalarNode) and k.value == name]
     if len(matches) > 1:
         raise YamlEditError('the key %r appears more than once in the same mapping' % (name,))
     if not matches:
         return None, None
-    if matches[0][0].tag == 'tag:yaml.org,2002:merge':
+    if matches[0][0].tag == 'tag:yaml.org,2002:merge' and not allow_merge:
         raise YamlEditError('merge keys (<<) cannot be edited with this module')
     return matches[0]
 
 
 def _nest(parts, value):
     for part in reversed(parts):
+        if isinstance(part, Selector):
+            raise YamlEditError('cannot create the list item %s; list items are never created by a key path '
+                                '(use yaml_list to add items)' % part.describe())
         if isinstance(part, int):
             raise YamlEditError('cannot create the list item [%d]; only mapping keys can be created' % part)
         value = {part: value}
@@ -905,6 +1109,32 @@ def normalize_value(value):
     return value
 
 
+_INFER_INT = re.compile(r'^-?(0|[1-9][0-9]*)$')
+_INFER_BOOL = {'true': True, 'True': True, 'TRUE': True, 'false': False, 'False': False, 'FALSE': False}
+
+
+def infer_types(value):
+    """Turn strings that are plainly integers or booleans into integers and booleans, recursively.
+
+    Ansible before 2.19 renders every templated number as a string, so
+    ``port: "{{ app_port }}"`` reaches the module as ``"8080"``. Only unambiguous
+    forms are converted: decimal integers without leading zeros, and
+    true/false. Floats stay strings, because ``"1.10"`` is more often a version
+    than a number. Dictionary keys are never converted.
+    """
+    if isinstance(value, str):
+        if _INFER_INT.match(value):
+            return int(value)
+        if value in _INFER_BOOL:
+            return _INFER_BOOL[value]
+        return value
+    if isinstance(value, dict):
+        return dict((k, infer_types(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return [infer_types(v) for v in value]
+    return value
+
+
 def convert_value(value, value_type):
     if value_type == 'raw':
         check_value(value)
@@ -964,6 +1194,54 @@ def _to_rt_value(value):
 # Edit context and runner
 # ---------------------------------------------------------------------------
 
+def parse_document(document):
+    """Normalise the ``document`` option: an index (int) or a Selector built from a dictionary."""
+    if document is None:
+        return 0
+    if isinstance(document, Selector):
+        return document
+    if isinstance(document, bool):
+        raise YamlEditError('document must be an index or a dictionary of fields, got a boolean')
+    if isinstance(document, int):
+        return int(document)
+    if isinstance(document, str) and re.match(r'^\s*[0-9]+\s*$', document):
+        return int(document)
+    if isinstance(document, dict):
+        return selector_from_dict(document, 'document')
+    raise YamlEditError('document must be an index (0 for the first document) or a dictionary of fields '
+                        'such as {kind: Deployment, metadata.name: web}, got %r' % (document,))
+
+
+def select_document(nodes, document):
+    """Return the index of the document chosen by ``document`` (an index, a dict or a Selector)."""
+    document = parse_document(document)
+    if isinstance(document, Selector):
+        matches = [i for i, node in enumerate(nodes) if node is not None and document.matches(node)]
+        fields = ', '.join('%s=%s' % ('.'.join(f), t) for f, t in document.conditions)
+        if not matches:
+            raise YamlEditError('no document matches %s; the file has %d document(s)' % (fields, len(nodes)))
+        if len(matches) > 1:
+            raise YamlEditError('documents %s all match %s; add fields so that a single document matches'
+                                % (', '.join(str(i) for i in matches), fields))
+        return matches[0]
+    if document < 0 or document >= len(nodes):
+        raise YamlEditError('document %d does not exist; the file has %d document(s)' % (document, len(nodes)))
+    return document
+
+
+def resolve_document(text, document, yaml_version='1.2'):
+    """Index of the document chosen by ``document`` in ``text``.
+
+    Modules resolve it once, before their first edit, so that every edit of a
+    task works on the same document even when an edit changes the fields that
+    selected it.
+    """
+    document = parse_document(document)
+    if not isinstance(document, Selector):
+        return document
+    return select_document(compose_documents(text, YAML_VERSIONS[yaml_version]) or [None], document)
+
+
 class Context(object):
     """A parsed YAML text, ready to plan one edit on one of its documents."""
 
@@ -977,8 +1255,7 @@ class Context(object):
             raise YamlEditError('could not read the YAML documents consistently')
         if not nodes:
             nodes, docs = [None], [None]
-        if document < 0 or document >= len(nodes):
-            raise YamlEditError('document %d does not exist; the file has %d document(s)' % (document, len(nodes)))
+        document = select_document(nodes, document)
         self.document = document
         self.nodes = nodes
         self.root = nodes[document]
@@ -1117,7 +1394,7 @@ def edit_yaml_text(text, key, state='present', value=None, document=0, edit_mode
     loc = ctx.locate(parts)
     plain_keys = ctx.plain_keys(loc.steps)
     existed = loc.found
-    previous = plain_to_json(_get_in(ctx.before[document], plain_keys)) if existed else None
+    previous = plain_to_json(_get_in(ctx.before[ctx.document], plain_keys)) if existed else None
     result_value = plain_to_json(to_plain(value)) if state == 'present' else None
 
     def result(new_text, method):
@@ -1163,6 +1440,11 @@ def _plan_create(ctx, loc, parts, plain_keys, value, after, before):
     if loc.missing_reason == 'index':
         raise YamlEditError('the list item %s does not exist (list items are never created; '
                             'use yaml_list to add items)' % format_key(parts[:i + 1]))
+    if loc.missing_reason == 'selector':
+        raise YamlEditError('no item of %s matches %s (list items are never created; use yaml_list to add items)'
+                            % (format_key(parts[:i]) if i else 'the document', parts[i].describe()))
+    if isinstance(parts[i], Selector):
+        raise YamlEditError('%s is null, so it has no list item %s' % (_describe(parts, i), parts[i].describe()))
     if isinstance(parts[i], int):
         raise YamlEditError('%s is null, so it has no list item [%d]' % (_describe(parts, i), parts[i]))
     new_key = parts[i]
@@ -1283,6 +1565,75 @@ def _plan_delete(ctx, loc, parts, plain_keys):
     return Plan(expected, lossless, roundtrip)
 
 
+# ---------------------------------------------------------------------------
+# Operation: rename a key (yaml_edit rename_to)
+# ---------------------------------------------------------------------------
+
+def rename_key_text(text, key, new_name, document=0, edit_mode='auto', yaml_version='1.2'):
+    """Rename the mapping key at ``key`` to ``new_name``, keeping its value and its position.
+
+    Nothing changes when the key does not exist (it may already have been
+    renamed). Returns an EditResult with ``existed`` and ``value`` info.
+    """
+    if not isinstance(new_name, str) or not new_name:
+        raise YamlEditError('rename_to must be a non-empty string')
+    new_name = str(new_name)
+    parts = parse_key(key)
+    ctx = Context(text, yaml_version, document)
+    loc = ctx.locate(parts)
+    if not loc.found:
+        if loc.missing_reason == 'key' and loc.missing_at == len(parts) - 1:
+            container = _get_in(ctx.before[ctx.document], ctx.plain_keys(loc.steps))
+            if isinstance(container, dict) and parts[-1] in container:
+                raise YamlEditError('the key %s is inherited through a merge key (<<) and cannot be renamed'
+                                    % format_key(parts))
+        return EditResult(text, False, None, existed=False, value=None)
+    step = loc.steps[-1]
+    if step.key_node is None:
+        raise YamlEditError('%s is a list item; only mapping keys can be renamed' % format_key(parts))
+    plain_keys = ctx.plain_keys(loc.steps)
+    value = plain_to_json(ctx.plain_at(loc.steps))
+    if isinstance(step.key_node, ScalarNode) and step.key_node.value == new_name:
+        return EditResult(text, False, None, existed=True, value=value)
+    if find_key(step.parent, new_name)[0] is not None:
+        raise YamlEditError('cannot rename %s to %r: that key already exists' % (format_key(parts), new_name))
+
+    old_plain = plain_keys[-1]
+    parent_keys = plain_keys[:-1]
+
+    def rename(container):
+        return dict((new_name if k == old_plain else k, v) for k, v in container.items())
+    expected = _set_in(ctx.before[ctx.document], parent_keys, rename)
+    order = list(_get_in(expected, parent_keys).keys())
+
+    def check(after_doc):
+        return list(_get_in(after_doc, parent_keys).keys()) == order
+
+    def lossless():
+        key_node = step.key_node
+        _refuse_alias(ctx, key_node)
+        if not isinstance(key_node, ScalarNode) or key_node.style not in (None, "'", '"'):
+            raise LosslessUnsupported('the key is not a simple scalar')
+        start, end = key_node.start_mark.index, key_node.end_mark.index
+        if '\n' in ctx.text[start:end] or ctx.text[start:start + 1] == '?':
+            raise LosslessUnsupported('the key spans several lines')
+        flow = step.parent.flow_style or _in_flow(loc, len(loc.steps))
+        return ctx.text[:start] + emit_key(new_name, flow=flow) + ctx.text[end:]
+
+    def roundtrip(docs):
+        rt_keys = ctx.rt_keys(loc.steps)
+        container = _rt_container(docs, ctx.document, rt_keys[:-1])
+        if getattr(container, 'merge', None):
+            raise LosslessUnsupported('renaming a key in a mapping that uses a merge key (<<)')
+        position = list(container.keys()).index(rt_keys[-1])
+        moved = container[rt_keys[-1]]
+        del container[rt_keys[-1]]
+        container.insert(position, _to_rt_value(new_name), moved)
+
+    new_text, method = run_plan(ctx, Plan(expected, lossless, roundtrip, check), edit_mode)
+    return EditResult(new_text, method is not None, method, existed=True, value=value)
+
+
 def _lossless_replace(ctx, loc, step, value, depth):
     text, newline, indent = ctx.text, ctx.newline, ctx.indent
     target = step.node
@@ -1377,14 +1728,14 @@ def insert_item_text(text, list_key, index, item, document=0, edit_mode='auto', 
         lst = list(lst)
         lst.insert(index, plain_item)
         return lst
-    expected = _set_in(ctx.before[document], plain_keys, insert)
+    expected = _set_in(ctx.before[ctx.document], plain_keys, insert)
 
     def lossless():
         return _lossless_insert(ctx, loc, seq, index, item)
 
     def roundtrip(docs):
         rt_keys = ctx.rt_keys(loc.steps)
-        _rt_container(docs, document, rt_keys).insert(index, _to_rt_value(item))
+        _rt_container(docs, ctx.document, rt_keys).insert(index, _to_rt_value(item))
 
     new_text, method = run_plan(ctx, Plan(expected, lossless, roundtrip), edit_mode)
     return EditResult(new_text, method is not None, method, index=index)
@@ -1465,12 +1816,21 @@ def ensure_list_item(text, list_key, item, identify_by=None, position='end', ind
         raise YamlEditError('position, index, after and before are mutually exclusive')
     parts = parse_key(list_key, allow_empty=True)
     ctx, loc, current = _list_state(text, parts, document, yaml_version)
+    document = ctx.document
+    parts = concrete_parts(parts, loc)
     pattern, partial = _item_pattern(item, identify_by)
     plain_item = to_plain(item)
 
     if current is None:
+        if not loc.found and loc.missing_reason == 'selector':
+            i = loc.missing_at
+            where = format_key(parts[:i]) if i else 'the document'
+            raise YamlEditError('no item of %s matches %s' % (where, parts[i].describe()))
         if not create:
             raise YamlEditError('the list %s does not exist and create=false' % format_key(parts))
+        if not loc.found and any(isinstance(p, Selector) for p in parts[loc.missing_at:]):
+            raise YamlEditError('the list %s does not exist and cannot be created, because its path '
+                                'selects list items' % format_key(parts))
         if not parts:
             raise YamlEditError('the document is empty; it cannot be turned into a list by yaml_list')
         if after is not None or before is not None:
@@ -1534,6 +1894,8 @@ def remove_list_items(text, list_key, item, identify_by=None, document=0, edit_m
     ctx, loc, current = _list_state(text, parts, document, yaml_version)
     if current is None:
         return EditResult(text, False, None, action='unchanged', removed=0)
+    document = ctx.document
+    parts = concrete_parts(parts, loc)
     pattern, partial = _item_pattern(item, identify_by)
     matches = [i for i, element in enumerate(current) if plain_matches(element, pattern, partial)]
     methods = []
@@ -1545,6 +1907,136 @@ def remove_list_items(text, list_key, item, identify_by=None, document=0, edit_m
     if not matches:
         return EditResult(text, False, None, action='unchanged', removed=0)
     return EditResult(text, True, combine_methods(*methods), action='removed', removed=len(matches))
+
+
+# ---------------------------------------------------------------------------
+# Operation: merge a dictionary (yaml_merge)
+# ---------------------------------------------------------------------------
+
+LIST_MERGE_CHOICES = ('replace', 'keep', 'append', 'prepend')
+
+
+def merge_yaml_text(text, key, value, list_merge='replace', create=True, document=0, edit_mode='auto',
+                    yaml_version='1.2'):
+    """Deep-merge the dictionary ``value`` into the mapping at ``key``.
+
+    The merge is a sequence of the same small edits yaml_edit and yaml_list
+    make, each one verified, so untouched parts of the file keep their exact
+    text. Returns an EditResult with ``changes`` info (the key paths changed).
+    """
+    if not isinstance(value, dict):
+        raise YamlEditError('value must be a dictionary')
+    if list_merge not in LIST_MERGE_CHOICES:
+        raise YamlEditError('list_merge must be one of %s' % ', '.join(LIST_MERGE_CHOICES))
+    check_value(value)
+    value = normalize_value(value)
+    parts = parse_key(key, allow_empty=True)
+    ctx = Context(text, yaml_version, document)
+    document = ctx.document
+    loc = ctx.locate(parts)
+    parts = concrete_parts(parts, loc)
+    common = dict(document=document, edit_mode=edit_mode, yaml_version=yaml_version)
+    state = dict(text=text, methods=[], changes=[])
+
+    def apply(res, path):
+        if res.changed:
+            state['text'] = res.text
+            state['methods'].append(res.method)
+            if list(path) not in state['changes']:
+                state['changes'].append(list(path))
+
+    if not loc.found or _is_null(loc.deepest):
+        if not parts:
+            raise YamlEditError('the document is empty; there is no mapping to merge into')
+        if not loc.found and not create:
+            raise YamlEditError('the key %s does not exist and create=false' % format_key(parts))
+        apply(edit_yaml_text(text, parts, value=value, **common), parts)
+    else:
+        _merge_into(state, parts, value, list_merge, apply, common)
+    changed = bool(state['changes'])
+    return EditResult(state['text'], changed, combine_methods(*state['methods']), changes=state['changes'])
+
+
+def _merge_into(state, parts, value, list_merge, apply, common):
+    ctx = Context(state['text'], common['yaml_version'], common['document'])
+    loc = ctx.locate(parts)
+    if not isinstance(loc.deepest, MappingNode):
+        # A scalar or a list becomes the dictionary, as with the combine filter.
+        apply(edit_yaml_text(state['text'], parts, value=value, **common), parts)
+        return
+    for name, new in value.items():
+        path = parts + [name]
+        ctx = Context(state['text'], common['yaml_version'], common['document'])
+        loc = ctx.locate(path)
+        if not loc.found:
+            apply(edit_yaml_text(state['text'], path, value=new, **common), path)
+            continue
+        node = loc.deepest
+        if isinstance(new, dict) and isinstance(node, MappingNode):
+            _merge_into(state, path, new, list_merge, apply, common)
+        elif isinstance(new, list) and isinstance(node, SequenceNode) and list_merge != 'replace':
+            if list_merge == 'keep':
+                continue
+            current = ctx.plain_at(loc.steps)
+            missing = []
+            for item in new:
+                plain = to_plain(item)
+                if plain not in current and plain not in [to_plain(m) for m in missing]:
+                    missing.append(item)
+            for offset, item in enumerate(missing):
+                res = ensure_list_item(state['text'], path, item,
+                                       index=offset if list_merge == 'prepend' else None, **common)
+                apply(res, path)
+        elif to_plain(new) != ctx.plain_at(loc.steps):
+            apply(edit_yaml_text(state['text'], path, value=new, **common), path)
+
+
+# ---------------------------------------------------------------------------
+# Operation: read a value (yaml_info)
+# ---------------------------------------------------------------------------
+
+def _type_name(plain):
+    if plain is None:
+        return 'null'
+    if isinstance(plain, dict):
+        return 'dict'
+    if isinstance(plain, list):
+        return 'list'
+    if isinstance(plain, str):
+        return 'str'
+    kind = plain[0]
+    if kind in ('bool', 'int', 'float'):
+        return kind
+    if kind == 'time':
+        return 'timestamp'
+    if kind in ('tagged', 'bytes'):
+        return 'str'
+    return 'other'
+
+
+def read_yaml_value(text, key=None, document=0, yaml_version='1.2'):
+    """Return ``dict(exists, value, type, document, documents)`` for the value at ``key``."""
+    parts = parse_key(key, allow_empty=True)
+    ctx = Context(text, yaml_version, document)
+    loc = locate(ctx.root, parts)
+    result = dict(exists=False, value=None, type=None, document=ctx.document, documents=len(ctx.nodes))
+    if loc.found:
+        plain = ctx.plain_at(loc.steps)
+    elif loc.missing_reason == 'key' and all(isinstance(p, (str, int)) for p in parts[loc.missing_at:]):
+        # The key may be inherited through a merge key (<<): look it up in the loaded data.
+        plain = ctx.plain_at(loc.steps)
+        for part in parts[loc.missing_at:]:
+            if isinstance(part, str) and isinstance(plain, dict) and part in plain:
+                plain = plain[part]
+            elif isinstance(part, int) and not isinstance(part, bool) and isinstance(plain, list) \
+                    and -len(plain) <= part < len(plain):
+                plain = plain[part]
+            else:
+                return result
+    else:
+        return result
+    result.update(exists=True, value=plain_to_json(plain), type=_type_name(plain))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1602,6 +2094,51 @@ def _write_atomically(module, real_path, data):
             os.unlink(tmp_path)
 
 
+def _check_ruamel(module):
+    if not HAS_RUAMEL:
+        from ansible.module_utils.basic import missing_required_lib
+        module.fail_json(msg=missing_required_lib('ruamel.yaml'), exception=RUAMEL_IMPORT_ERROR)
+
+
+def _read_target(path):
+    """Return (real path, text, bom) of an existing YAML file."""
+    if not os.path.exists(to_bytes(path, errors='surrogate_or_strict')):
+        raise YamlEditError('the file %s does not exist' % path)
+    real_path = os.path.realpath(path)
+    if os.path.isdir(real_path):
+        raise YamlEditError('%s is a directory' % path)
+    text, bom = read_yaml_file(real_path)
+    return real_path, text, bom
+
+
+def _call_reporting_errors(module, func, result):
+    """Call ``func()`` and turn the errors it raises into a module failure that reveals no file content."""
+    try:
+        return func()
+    except YamlEditError as e:
+        module.fail_json(msg=to_native(e), **result)
+    except YAMLError as e:
+        module.fail_json(msg=describe_yaml_error(e), **result)
+    except RecursionError:
+        module.fail_json(msg='the YAML document is too deeply nested', **result)
+    except (IOError, OSError) as e:
+        module.fail_json(msg='cannot read %s: %s' % (result.get('path'), to_native(e)), **result)
+
+
+def run_file_read(module, read, result):
+    """Read the file, call ``read(text) -> dict`` and exit the module with those values. Never writes."""
+    _check_ruamel(module)
+    result.setdefault('changed', False)
+    result['path'] = module.params['path']
+
+    def run():
+        real_path, text, _bom = _read_target(module.params['path'])
+        result['path'] = real_path
+        return read(text)
+    result.update(_call_reporting_errors(module, run, result))
+    module.exit_json(**result)
+
+
 def run_file_edit(module, edit, result):
     """Read the file, call ``edit(text) -> EditResult``, write the result and exit the module.
 
@@ -1609,10 +2146,7 @@ def run_file_edit(module, edit, result):
     handles check mode, diff mode, backups, validation, atomic writes, file
     attributes and error reporting for every module of the collection.
     """
-    if not HAS_RUAMEL:
-        from ansible.module_utils.basic import missing_required_lib
-        module.fail_json(msg=missing_required_lib('ruamel.yaml'), exception=RUAMEL_IMPORT_ERROR)
-
+    _check_ruamel(module)
     params = module.params
     path = params['path']
     validate = params['validate']
@@ -1622,23 +2156,11 @@ def run_file_edit(module, edit, result):
     result.setdefault('method', None)
     result['path'] = path
 
-    try:
-        if not os.path.exists(to_bytes(path, errors='surrogate_or_strict')):
-            raise YamlEditError('the file %s does not exist' % path)
-        real_path = os.path.realpath(path)
-        if os.path.isdir(real_path):
-            raise YamlEditError('%s is a directory' % path)
+    def run():
+        real_path, text, bom = _read_target(path)
         result['path'] = real_path
-        text, bom = read_yaml_file(real_path)
-        outcome = edit(text)
-    except YamlEditError as e:
-        module.fail_json(msg=to_native(e), **result)
-    except YAMLError as e:
-        module.fail_json(msg=describe_yaml_error(e), **result)
-    except RecursionError:
-        module.fail_json(msg='the YAML document is too deeply nested', **result)
-    except (IOError, OSError) as e:
-        module.fail_json(msg='cannot read %s: %s' % (path, to_native(e)), **result)
+        return real_path, text, bom, edit(text)
+    real_path, text, bom, outcome = _call_reporting_errors(module, run, result)
 
     result['changed'] = outcome.changed
     result['method'] = outcome.method

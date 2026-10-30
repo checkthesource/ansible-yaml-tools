@@ -1,0 +1,120 @@
+---
+# Integration tests for yaml_merge.
+# Run with: ansible-test integration yaml_merge
+
+- name: Create a work directory
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: yaml_merge
+  register: workdir
+
+- name: Run the tests
+  vars:
+    config: "{{ workdir.path }}/config.yaml"
+    app_port: "8443"
+  block:
+    - name: Write the test file
+      ansible.builtin.copy:
+        dest: "{{ config }}"
+        mode: "0644"
+        content: |
+          # Application settings
+          server:
+            port: 80          # public port
+            tls:
+              enabled: false
+            hosts:
+              - a.example.com
+          logging: {level: WARN}
+
+    - name: Merge settings in check mode
+      checkthesource.yaml_tools.yaml_merge:
+        path: "{{ config }}"
+        key: server
+        value:
+          port: "{{ app_port }}"
+          tls:
+            enabled: true
+          hosts: [b.example.com]
+        list_merge: append
+      check_mode: true
+      diff: true
+      register: merge_check
+
+    - name: Merge settings
+      checkthesource.yaml_tools.yaml_merge:
+        path: "{{ config }}"
+        key: server
+        value:
+          port: "{{ app_port }}"
+          tls:
+            enabled: true
+          hosts: [b.example.com]
+        list_merge: append
+      register: merged
+
+    - name: Merge them again
+      checkthesource.yaml_tools.yaml_merge:
+        path: "{{ config }}"
+        key: server
+        value:
+          port: "{{ app_port }}"
+          tls:
+            enabled: true
+          hosts: [b.example.com]
+        list_merge: append
+      register: merged_again
+
+    - name: Merge a new section into the top of the document
+      checkthesource.yaml_tools.yaml_merge:
+        path: "{{ config }}"
+        value:
+          cache:
+            ttl: 60
+      register: new_section
+
+    - name: Merging into a missing mapping fails with create=false
+      checkthesource.yaml_tools.yaml_merge:
+        path: "{{ config }}"
+        key: missing
+        value: {a: 1}
+        create: false
+      register: no_create
+      ignore_errors: true
+
+    - name: Read the file
+      ansible.builtin.slurp:
+        src: "{{ config }}"
+      register: config_content
+
+    - name: Check the results
+      vars:
+        content: "{{ config_content.content | b64decode }}"
+        expected: |
+          # Application settings
+          server:
+            port: 8443          # public port
+            tls:
+              enabled: true
+            hosts:
+              - a.example.com
+              - b.example.com
+          logging: {level: WARN}
+          cache:
+            ttl: 60
+      ansible.builtin.assert:
+        that:
+          - merge_check is changed
+          - merge_check.diff.after != merge_check.diff.before
+          - merged is changed and merged.method == 'lossless'
+          - merged.changes == [['server', 'port'], ['server', 'tls', 'enabled'], ['server', 'hosts']]
+          - merged_again is not changed and merged_again.changes == []
+          - new_section is changed
+          - no_create is failed
+          - content == expected
+
+  always:
+    - name: Remove the work directory
+      ansible.builtin.file:
+        path: "{{ workdir.path }}"
+        state: absent
